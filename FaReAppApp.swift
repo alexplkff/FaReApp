@@ -13,7 +13,9 @@ struct FaReAppApp: App {
                 .task {
                     #if DEBUG
                     if ProcessInfo.processInfo.arguments.contains("--self-test") { LayoutChecks.run() }
-                    if ProcessInfo.processInfo.arguments.contains("--navigation-test") { await NavigationChecks.run() }
+                    if ProcessInfo.processInfo.arguments.contains("--navigation-test") {
+                        Task { @MainActor in await NavigationChecks.run() }
+                    }
                     #endif
                 }
         }
@@ -31,57 +33,122 @@ import WebKit
 
 @MainActor
 final class NavigationChecks: NSObject, WKNavigationDelegate {
-    var loaded: CheckedContinuation<Void, Error>?
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { loaded?.resume(); loaded = nil }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { loaded?.resume(throwing: error); loaded = nil }
+    private static var hasRun = false
     static func run() async {
-        var cases: [String] = []
-        let delegate = NavigationChecks()
-        let view = WKWebView(frame: CGRect(x: -1000, y: 0, width: 362, height: 600))
-        view.navigationDelegate = delegate
-        let window = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.keyWindow
-        window?.addSubview(view)
-        defer { view.removeFromSuperview() }
+        guard !hasRun else { return }
+        hasRun = true
         do {
             let longParagraph = (0..<1400).map { "слово\($0)" }.joined(separator: " ")
             let xml = "<FictionBook><body><section><p>Начало 😀 &amp; <strong>кириллица</strong> " + longParagraph + "</p></section></body></FictionBook>"
             let book = try BookParser.parse(data: Data(xml.utf8), fileName: "long.fb2")
             let offset = (book.text as NSString).range(of: "слово900").location
-            let html = """
-            <html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>
-            html,body{margin:0;padding:0}body{width:100vw;height:100dvh;column-count:1;column-gap:0;column-fill:auto;font:20px/28px Georgia}p{margin:0}
-            </style></head><body>\(book.richHTML!)<script>\(ReaderNavigation.script)</script></body></html>
-            """
-            try await withCheckedThrowingContinuation { continuation in
-                delegate.loaded = continuation
-                view.loadHTMLString(html, baseURL: nil)
-            }
-            func verify(_ expression: String, _ name: String) async throws {
-                guard let passed = try await view.evaluateJavaScript(expression) as? Bool, passed else { throw NSError(domain: name, code: 1) }
-                cases.append(name)
-            }
-            _ = try await view.evaluateJavaScript("jump(\(offset),'first-handoff')")
-            try await verify("(()=>{const r=readerTextRange(\(offset)).getBoundingClientRect();return scrollX>innerWidth*5 && r.left>=-1 && r.right<=innerWidth+1})()", "Точное слово в длинном абзаце находится на видимой странице")
-            _ = try await view.evaluateJavaScript("jump(0,'back');jump(\(offset),'repeat-handoff')")
-            try await verify("(()=>{const r=readerTextRange(\(offset)).getBoundingClientRect();return r.left>=-1 && r.right<=innerWidth+1 && readerNavigationID==='repeat-handoff'})()", "Повторный выход скорочтения повторяет переход к слову")
-            _ = try await view.evaluateJavaScript("document.body.style.fontSize='32px';jump(\(offset),'resized')")
-            try await verify("(()=>{const r=readerTextRange(\(offset)).getBoundingClientRect();return r.left>=-1 && r.right<=innerWidth+1})()", "Переход после изменения размера шрифта")
-            try await verify("readerTapDirection(10,362)===-1 && readerTapDirection(180,362)===0 && readerTapDirection(350,362)===1", "Зоны экрана: влево, управление, вправо")
-            _ = try await view.evaluateJavaScript("jump(0,'tap-test');readerTurn(1)")
-            try await verify("Math.abs(scrollX-innerWidth)<1", "Нажатие справа переходит ровно на следующую страницу")
-            _ = try await view.evaluateJavaScript("readerTurn(-1)")
-            try await verify("scrollX===0", "Нажатие слева возвращает страницу назад")
-            _ = try await view.evaluateJavaScript("readerTurn(-1)")
-            try await verify("scrollX===0", "Перелистывание не выходит за начало книги")
-            _ = try await view.evaluateJavaScript("document.body.style.columnCount='auto';document.body.style.height='auto';jump(\(offset),'scroll-mode')")
-            try await verify("(()=>{const r=readerTextRange(\(offset)).getBoundingClientRect();return scrollY>0 && r.top>=-1 && r.bottom<innerHeight})()", "Прокрутка к тому же слову")
-            let report: [String: Any] = ["status":"passed", "cases":cases, "offset":offset]
-            write(report)
-        } catch { write(["status":"failed", "cases":cases, "error":String(describing: error)]) }
+            let cases = try await runHosted(book: book, offset: offset)
+            write(["status":"passed", "cases":cases, "offset":offset])
+        } catch { write(["status":"failed", "error":String(describing: error)]) }
     }
     static func write(_ report: [String: Any]) {
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("navigation-checks.json")
         try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]).write(to: url, options: .atomic)
+    }
+
+    // Exercise the actual SwiftUI representable, including paging-enabled WKWebView,
+    // modal dismissal and switching modes. An isolated JS call cannot catch these races.
+    static func runHosted(book: Book, offset: Int) async throws -> [String] {
+        guard let root = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.keyWindow?.rootViewController else {
+            throw NSError(domain: "No test window", code: 1)
+        }
+        let state = HandoffState(book)
+        let host = UIHostingController(rootView: HandoffHarness(state: state))
+        host.modalPresentationStyle = .fullScreen
+        await withCheckedContinuation { continuation in root.present(host, animated: false) { continuation.resume() } }
+        func webView(in view: UIView) -> WKWebView? {
+            if let web = view as? WKWebView { return web }
+            return view.subviews.lazy.compactMap { webView(in: $0) }.first
+        }
+        func visible(_ name: String, paged: Bool, target: Int? = nil) async throws {
+            let target = target ?? offset
+            for _ in 0..<120 {
+                if let web = webView(in: host.view),
+                   let result = try? await web.evaluateJavaScript("""
+                   (()=>{if(typeof readerTextRange!=='function'||readerNavigationID!=='\(state.navigationID.uuidString)')return false;
+                   const range=readerTextRange(\(target));if(!range)return false;const r=range.getBoundingClientRect();
+                   return r.left>=-1&&r.right<=innerWidth+1&&r.top>=-1&&r.bottom<=innerHeight+1
+                     &&(getComputedStyle(document.body).columnCount==='1')===\(paged ? "true" : "false")})()
+                   """) as? Bool, result { return }
+                try await Task.sleep(for: .milliseconds(25))
+            }
+            throw NSError(domain: name, code: 1)
+        }
+        do {
+            let speed = UIViewController()
+            speed.modalPresentationStyle = .fullScreen
+            await withCheckedContinuation { continuation in host.present(speed, animated: false) { continuation.resume() } }
+            state.book.position = offset
+            await withCheckedContinuation { continuation in speed.dismiss(animated: false) { continuation.resume() } }
+            state.book.normalPosition = state.book.position
+            state.navigationID = UUID()
+            try await visible("Страницы после закрытия скорочтения", paged: true)
+            state.book.settings.mode = "scroll"
+            state.navigationID = UUID()
+            try await visible("Прокрутка после Страниц", paged: false)
+            state.book.settings.mode = "page"
+            state.navigationID = UUID()
+            try await visible("Страницы после Прокрутки", paged: true)
+            state.immersive = true
+            state.navigationID = UUID()
+            try await visible("Полноэкранные Страницы", paged: true)
+            state.book.normalFontSize = 32
+            state.navigationID = UUID()
+            try await visible("Страницы после изменения шрифта", paged: true)
+            state.book.normalPosition = 0
+            state.navigationID = UUID()
+            try await visible("Возврат на первую страницу", paged: true, target: 0)
+            guard let web = webView(in: host.view) else { throw NSError(domain: "No WebView", code: 1) }
+            func checkJS(_ script: String, _ name: String) async throws {
+                for _ in 0..<80 {
+                    if let value = try? await web.evaluateJavaScript(script) as? Bool, value { return }
+                    try await Task.sleep(for: .milliseconds(25))
+                }
+                throw NSError(domain: name, code: 1)
+            }
+            try await checkJS("readerTapDirection(10,362)===-1&&readerTapDirection(181,362)===0&&readerTapDirection(350,362)===1", "Зоны экрана")
+            _ = try await web.evaluateJavaScript("readerTurn(1)")
+            try await checkJS("Math.abs(scrollX-innerWidth)<1", "Следующая страница")
+            _ = try await web.evaluateJavaScript("readerTurn(-1)")
+            try await checkJS("scrollX===0", "Предыдущая страница")
+            _ = try await web.evaluateJavaScript("readerTurn(-1)")
+            try await checkJS("scrollX===0", "Граница первой страницы")
+            await withCheckedContinuation { continuation in host.dismiss(animated: false) { continuation.resume() } }
+            return ["Реальная WKWebView: Страницы после закрытия скорочтения",
+                    "Реальная WKWebView: Прокрутка после Страниц",
+                    "Реальная WKWebView: Страницы после Прокрутки",
+                    "Реальная WKWebView: полноэкранные Страницы",
+                    "Реальная WKWebView: Страницы после изменения шрифта",
+                    "Реальная WKWebView: возврат на первую страницу",
+                    "Реальная WKWebView: зоны перелистывания",
+                    "Реальная WKWebView: следующая страница",
+                    "Реальная WKWebView: предыдущая страница",
+                    "Реальная WKWebView: граница начала книги"]
+        } catch {
+            await withCheckedContinuation { continuation in host.dismiss(animated: false) { continuation.resume() } }
+            throw error
+        }
+    }
+}
+
+@MainActor
+final class HandoffState: ObservableObject {
+    @Published var book: Book
+    @Published var navigationID = UUID()
+    @Published var immersive = false
+    init(_ book: Book) { self.book = book }
+}
+struct HandoffHarness: View {
+    @ObservedObject var state: HandoffState
+    var body: some View {
+        RichReadingSurface(html: state.book.richHTML!, book: $state.book, highlight: nil,
+                           navigationID: state.navigationID, immersive: state.immersive, onRevealControls: {})
+            .id("\(state.navigationID)-\(state.book.settings.mode)")
     }
 }
 

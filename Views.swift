@@ -52,10 +52,11 @@ enum ReaderNavigation {
       if(range){
         programmatic=true;
         const rect=range.getBoundingClientRect();
-        if(paged)scrollTo(Math.floor((rect.left+scrollX+0.5)/innerWidth)*innerWidth,0);
-        else scrollTo(0,Math.max(0,rect.top+scrollY-8));
+        const targetX=paged?Math.floor((rect.left+scrollX+0.5)/innerWidth)*innerWidth:0;
+        const targetY=paged?0:Math.max(0,rect.top+scrollY-8);
+        scrollTo(targetX,targetY);
         setTimeout(()=>programmatic=false,250);
-        return {offset,page:Math.round(scrollX/innerWidth),found:true};
+        return {offset,page:Math.round(targetX/innerWidth),targetX,targetY,found:true};
       }
       const target=[...document.querySelectorAll('[data-offset]')].filter(n=>Number(n.dataset.offset)<=offset).pop();
       if(target){programmatic=true;target.scrollIntoView({block:'start',inline:'start'});
@@ -122,7 +123,11 @@ struct RichReadingSurface: UIViewRepresentable {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         configuration.userContentController.add(context.coordinator, name: "position")
-        let view = WKWebView(frame: .zero, configuration: configuration)
+        let view = ReadingWebView(frame: .zero, configuration: configuration)
+        view.onViewportChange = { [weak coordinator = context.coordinator, weak view] in
+            guard let coordinator, let view else { return }
+            coordinator.navigate(view)
+        }
         view.navigationDelegate = context.coordinator
         view.isOpaque = false; view.backgroundColor = .clear
         view.scrollView.backgroundColor = .clear
@@ -136,6 +141,8 @@ struct RichReadingSurface: UIViewRepresentable {
         if coordinator.key != key {
             coordinator.key = key
             coordinator.ready = false
+            coordinator.documentID = UUID()
+            coordinator.pendingRequest = nil
             let dark = book.settings.theme == "dark" || (book.settings.theme == "system" && view.traitCollection.userInterfaceStyle == .dark)
             let color = dark ? "#eee" : "#181818"
             let bg = dark ? "#111" : book.settings.theme == "sepia" ? "#f7edd4" : "#fff"
@@ -199,7 +206,10 @@ struct RichReadingSurface: UIViewRepresentable {
         if coordinator.ready { view.evaluateJavaScript("readerImmersive=\(immersive ? "true" : "false")", completionHandler: nil) }
         coordinator.applyHighlight(view)
     }
-    static func dismantleUIView(_ view: WKWebView, coordinator: Coordinator) { view.configuration.userContentController.removeScriptMessageHandler(forName: "position") }
+    static func dismantleUIView(_ view: WKWebView, coordinator: Coordinator) {
+        (view as? ReadingWebView)?.onViewportChange = nil
+        view.configuration.userContentController.removeScriptMessageHandler(forName: "position")
+    }
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         var parent: RichReadingSurface
         var key = ""
@@ -207,6 +217,9 @@ struct RichReadingSurface: UIViewRepresentable {
         var lastHighlight: NSRange?
         var lastNavigationID: UUID?
         var ready = false
+        var lastViewport = CGSize.zero
+        var pendingRequest: String?
+        var documentID = UUID()
         init(_ parent: RichReadingSurface) { self.parent = parent }
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             ready = true
@@ -217,10 +230,37 @@ struct RichReadingSurface: UIViewRepresentable {
             applyHighlight(webView)
         }
         func navigate(_ view: WKWebView) {
-            guard ready, lastPosition != parent.book.normalPosition || lastNavigationID != parent.navigationID else { return }
-            lastPosition = parent.book.normalPosition
-            lastNavigationID = parent.navigationID
-            view.evaluateJavaScript("jump(\(lastPosition), '\(parent.navigationID.uuidString)')", completionHandler: nil)
+            let viewport = view.bounds.size
+            guard ready, view.window != nil, viewport.width > 1, viewport.height > 1,
+                  lastPosition != parent.book.normalPosition || lastNavigationID != parent.navigationID || lastViewport != viewport else { return }
+            let offset = parent.book.normalPosition
+            let navigationID = parent.navigationID
+            let request = "\(documentID)-\(navigationID)-\(offset)-\(viewport)"
+            guard pendingRequest != request else { return }
+            pendingRequest = request
+            view.callAsyncJavaScript("""
+                await document.fonts.ready;
+                await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+                return jump(offset, navigationID);
+                """, arguments: ["offset":offset, "navigationID":navigationID.uuidString], in: nil, in: .page) { [weak self, weak view] result in
+                guard let self, let view, self.pendingRequest == request else { return }
+                self.pendingRequest = nil
+                guard self.parent.navigationID == navigationID, self.parent.book.normalPosition == offset,
+                      view.bounds.size == viewport else { self.navigate(view); return }
+                if case .success(let value) = result {
+                    if let target = value as? [String: Any],
+                       let x = target["targetX"] as? Double, let y = target["targetY"] as? Double {
+                        // WKWebView's native paging scroll view can retain its old page
+                        // when the SwiftUI cover is dismissed. Apply the same target there.
+                        let maxX = max(0, view.scrollView.contentSize.width - viewport.width)
+                        let maxY = max(0, view.scrollView.contentSize.height - viewport.height)
+                        view.scrollView.setContentOffset(CGPoint(x: min(maxX, max(0, x)), y: min(maxY, max(0, y))), animated: false)
+                    }
+                    self.lastPosition = offset
+                    self.lastNavigationID = navigationID
+                    self.lastViewport = viewport
+                }
+            }
         }
         func applyHighlight(_ view: WKWebView) {
             guard let range = parent.highlight, range != lastHighlight, NSMaxRange(range) <= (parent.book.text as NSString).length else { return }
@@ -241,7 +281,7 @@ struct RichReadingSurface: UIViewRepresentable {
             view.evaluateJavaScript(script, completionHandler: nil)
         }
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard ready else { return }
+            guard ready, pendingRequest == nil else { return }
             if let command = message.body as? [String: Any], command["action"] as? String == "reveal" {
                 parent.onRevealControls()
                 return
@@ -260,6 +300,21 @@ struct RichReadingSurface: UIViewRepresentable {
             }
             decisionHandler(.allow)
         }
+    }
+}
+
+final class ReadingWebView: WKWebView {
+    var onViewportChange: (() -> Void)?
+    private var viewport = CGSize.zero
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.size != viewport else { return }
+        viewport = bounds.size
+        DispatchQueue.main.async { [weak self] in self?.onViewportChange?() }
+    }
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { DispatchQueue.main.async { [weak self] in self?.onViewportChange?() } }
     }
 }
 private extension Optional where Wrapped == String {
@@ -416,9 +471,10 @@ struct ReaderView: View {
                 Group {
                     if let html = book.richHTML {
                         RichReadingSurface(html: html, book: $book, highlight: highlighted, navigationID: readerNavigationID, immersive: immersive, onRevealControls: { immersive = false })
+                            .id("\(readerNavigationID)-\(book.settings.mode)")
                     } else {
                         ReadingSurface(book: $book, size: CGSize(width: max(80, width), height: max(80, geometry.size.height - 24)), highlight: highlighted, immersive: immersive, onRevealControls: { immersive = false })
-                            .id(readerNavigationID)
+                            .id("\(readerNavigationID)-\(book.settings.mode)")
                     }
                 }
                     .frame(width: max(80, width), height: max(80, geometry.size.height - 24))
