@@ -19,13 +19,27 @@ enum ReaderNavigation {
         scrollTo(Math.min(last,Math.max(0,page+direction))*innerWidth,0);
       }else scrollBy(0,direction*innerHeight*0.9);
     }
-    document.addEventListener('click',e=>{
-      if(!readerImmersive)return;
-      e.preventDefault();e.stopImmediatePropagation();
-      const direction=readerTapDirection(e.clientX,innerWidth);
-      if(direction===0)webkit.messageHandlers.position.postMessage({action:'reveal'});
-      else readerTurn(direction);
-    },true);
+    function readerVisibleOffset(){
+      const paged=getComputedStyle(document.body).columnCount==='1';
+      for(const run of document.querySelectorAll('[data-text-offset]')){
+        if(run.closest('.footnotes'))continue;
+        const boxes=[...run.getClientRects()];
+        if(!boxes.some(r=>r.right>0&&r.left<innerWidth&&r.bottom>0&&r.top<innerHeight))continue;
+        const start=Number(run.dataset.textOffset);
+        let low=0,high=run.textContent.length;
+        while(low<high){
+          const mid=Math.floor((low+high)/2);
+          const range=readerTextRange(start+mid);
+          if(!range)break;
+          const r=range.getBoundingClientRect();
+          const before=paged?r.right<=0:r.bottom<=0;
+          if(before)low=mid+1;else high=mid;
+        }
+        const r=readerTextRange(start+low)?.getBoundingClientRect();
+        if(r&&r.right>0&&r.left<innerWidth&&r.bottom>0&&r.top<innerHeight)return start+low;
+      }
+      return null;
+    }
     function readerTextRange(offset) {
       const runs=[...document.querySelectorAll('[data-text-offset]')];
       let target=runs.find(n=>Number(n.dataset.textOffset)<=offset &&
@@ -118,8 +132,11 @@ struct RichReadingSurface: UIViewRepresentable {
     let navigationID: UUID
     let immersive: Bool
     let onRevealControls: () -> Void
+    var textWidth: CGFloat? = nil
+    var bridge: ReaderViewportBridge? = nil
+    var suspended = false
     func makeCoordinator() -> Coordinator { Coordinator(self) }
-    func makeUIView(context: Context) -> WKWebView {
+    func makeUIView(context: Context) -> ReaderCanvasView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
         configuration.userContentController.add(context.coordinator, name: "position")
@@ -129,13 +146,27 @@ struct RichReadingSurface: UIViewRepresentable {
             coordinator.navigate(view)
         }
         view.navigationDelegate = context.coordinator
+        context.coordinator.webView = view
+        view.scrollView.panGestureRecognizer.addTarget(context.coordinator, action: #selector(Coordinator.scrollGestureEnded(_:)))
         view.isOpaque = false; view.backgroundColor = .clear
         view.scrollView.backgroundColor = .clear
-        return view
+        let canvas = ReaderCanvasView(webView: view)
+        let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.readerTapped(_:)))
+        tap.delegate = context.coordinator
+        tap.cancelsTouchesInView = false
+        canvas.addGestureRecognizer(tap)
+        return canvas
     }
-    func updateUIView(_ view: WKWebView, context: Context) {
+    func updateUIView(_ canvas: ReaderCanvasView, context: Context) {
+        let view = canvas.webView
         let coordinator = context.coordinator
         coordinator.parent = self
+        canvas.textWidth = textWidth
+        canvas.setNeedsLayout()
+        bridge?.capture = { [weak coordinator, weak view] in
+            guard let coordinator, let view else { return nil }
+            return await coordinator.capturePosition(view)
+        }
         view.scrollView.isPagingEnabled = book.settings.mode == "page"
         let key = "\(book.normalFontSize)-\(book.lineSpacing)-\(book.settings)-\(view.traitCollection.userInterfaceStyle.rawValue)-\(immersive)"
         if coordinator.key != key {
@@ -184,19 +215,10 @@ struct RichReadingSurface: UIViewRepresentable {
             let timer;
             addEventListener('scroll',()=>{clearTimeout(timer);timer=setTimeout(()=>{
               if(programmatic)return;
-              const node=document.elementFromPoint(12,24)?.closest('[data-offset]');
-              if(node?.closest('.footnotes'))return;
               const root=document.scrollingElement;
               const paged=getComputedStyle(document.body).columnCount==='1';
               const ended=paged?scrollX+innerWidth>=root.scrollWidth-2:scrollY+innerHeight>=root.scrollHeight-2;
-              let offset=node?Number(node.dataset.offset):null;
-              const caret=document.caretRangeFromPoint(12,24);
-              const span=caret?.startContainer.parentElement?.closest('[data-text-offset]');
-              if(span){
-                const prefix=document.createRange();prefix.selectNodeContents(span);
-                prefix.setEnd(caret.startContainer,caret.startOffset);
-                offset=Number(span.dataset.textOffset)+prefix.toString().length;
-              }
+              const offset=readerVisibleOffset();
               if(offset!==null)webkit.messageHandlers.position.postMessage({offset,ended,navigationID:readerNavigationID});
             },150)});
             </script></body></html>
@@ -206,11 +228,15 @@ struct RichReadingSurface: UIViewRepresentable {
         if coordinator.ready { view.evaluateJavaScript("readerImmersive=\(immersive ? "true" : "false")", completionHandler: nil) }
         coordinator.applyHighlight(view)
     }
-    static func dismantleUIView(_ view: WKWebView, coordinator: Coordinator) {
-        (view as? ReadingWebView)?.onViewportChange = nil
+    static func dismantleUIView(_ canvas: ReaderCanvasView, coordinator: Coordinator) {
+        coordinator.ready = false
+        coordinator.pendingRequest = nil
+        let view = canvas.webView
+        view.onViewportChange = nil
+        view.scrollView.panGestureRecognizer.removeTarget(coordinator, action: #selector(Coordinator.scrollGestureEnded(_:)))
         view.configuration.userContentController.removeScriptMessageHandler(forName: "position")
     }
-    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler, UIGestureRecognizerDelegate {
         var parent: RichReadingSurface
         var key = ""
         var lastPosition = -1
@@ -220,6 +246,8 @@ struct RichReadingSurface: UIViewRepresentable {
         var lastViewport = CGSize.zero
         var pendingRequest: String?
         var documentID = UUID()
+        var synchronizedOffset = CGPoint.zero
+        weak var webView: WKWebView?
         init(_ parent: RichReadingSurface) { self.parent = parent }
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             ready = true
@@ -259,6 +287,7 @@ struct RichReadingSurface: UIViewRepresentable {
                     self.lastPosition = offset
                     self.lastNavigationID = navigationID
                     self.lastViewport = viewport
+                    self.synchronizedOffset = view.scrollView.contentOffset
                 }
             }
         }
@@ -281,7 +310,7 @@ struct RichReadingSurface: UIViewRepresentable {
             view.evaluateJavaScript(script, completionHandler: nil)
         }
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard ready, pendingRequest == nil else { return }
+            guard ready, pendingRequest == nil, !parent.suspended else { return }
             if let command = message.body as? [String: Any], command["action"] as? String == "reveal" {
                 parent.onRevealControls()
                 return
@@ -293,6 +322,56 @@ struct RichReadingSurface: UIViewRepresentable {
                 if data["ended"] as? Bool == true { parent.book.isFinished = true }
             }
         }
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
+        @objc func readerTapped(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended, let canvas = gesture.view as? ReaderCanvasView,
+                  ready, pendingRequest == nil, !parent.suspended else { return }
+            let direction = ReadingTapZones.direction(x: gesture.location(in: canvas).x, width: canvas.bounds.width)
+            if direction == 0 { if parent.immersive { parent.onRevealControls() }; return }
+            let view = canvas.webView
+            guard parent.book.settings.mode == "page" || parent.immersive else { return }
+            let current = view.scrollView.contentOffset
+            let paged = parent.book.settings.mode == "page"
+            let width = view.bounds.width
+            let maxX = max(0, view.scrollView.contentSize.width - width)
+            let maxY = max(0, view.scrollView.contentSize.height - view.bounds.height)
+            let x = paged ? min(maxX, max(0, (round(current.x / width) + CGFloat(direction)) * width)) : 0
+            let y = paged ? 0 : min(maxY, max(0, current.y + CGFloat(direction) * view.bounds.height * 0.9))
+            view.scrollView.setContentOffset(CGPoint(x: x, y: y), animated: false)
+            Task { @MainActor in _ = await capturePosition(view) }
+        }
+        func capturePosition(_ view: WKWebView) async -> Int? {
+            guard ready, !parent.suspended else { return parent.book.normalPosition }
+            if pendingRequest != nil || view.scrollView.contentOffset == synchronizedOffset { return parent.book.normalPosition }
+            let id = parent.navigationID
+            let result: Any? = await withCheckedContinuation { continuation in
+                view.callAsyncJavaScript("""
+                    await new Promise(resolve=>requestAnimationFrame(resolve));
+                    return readerVisibleOffset();
+                    """, arguments: [:], in: nil, in: .page) { result in
+                    switch result {
+                    case .success(let value): continuation.resume(returning: value)
+                    case .failure: continuation.resume(returning: nil)
+                    }
+                }
+            }
+            guard parent.navigationID == id, !parent.suspended, let offset = result as? Int else { return parent.book.normalPosition }
+            synchronizedOffset = view.scrollView.contentOffset
+            lastPosition = offset
+            parent.book.normalPosition = offset
+            return offset
+        }
+        @objc func scrollGestureEnded(_ gesture: UIPanGestureRecognizer) {
+            guard gesture.state == .ended || gesture.state == .cancelled, let view = webView else { return }
+            Task { @MainActor [weak self, weak view] in
+                guard let self, let view else { return }
+                for _ in 0..<120 {
+                    try? await Task.sleep(for: .milliseconds(25))
+                    if !view.scrollView.isDecelerating && !view.scrollView.isDragging { break }
+                }
+                _ = await self.capturePosition(view)
+            }
+        }
         func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
             if navigationAction.navigationType == .linkActivated {
                 guard let url = navigationAction.request.url, !url.fragment.isNilOrEmpty else { decisionHandler(.cancel); return }
@@ -300,6 +379,28 @@ struct RichReadingSurface: UIViewRepresentable {
             }
             decisionHandler(.allow)
         }
+    }
+}
+
+@MainActor
+final class ReaderViewportBridge {
+    var capture: (() async -> Int?)?
+}
+
+final class ReaderCanvasView: UIView {
+    let webView: ReadingWebView
+    var textWidth: CGFloat?
+    init(webView: ReadingWebView) {
+        self.webView = webView
+        super.init(frame: .zero)
+        backgroundColor = .clear
+        addSubview(webView)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:)") }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let width = min(bounds.width, textWidth ?? bounds.width)
+        webView.frame = CGRect(x: (bounds.width - width) / 2, y: 0, width: width, height: bounds.height)
     }
 }
 
@@ -458,11 +559,19 @@ struct ReaderView: View {
     @State private var finishedAlert = false
     @State private var readerNavigationID = UUID()
     @State private var immersive = false
+    @State private var viewportBridge = ReaderViewportBridge()
 
     var body: some View {
         VStack(spacing: 0) {
             if !immersive {
-            Picker("Режим", selection: $book.settings.mode) {
+            Picker("Режим", selection: Binding(get: { book.settings.mode }, set: { mode in
+                Task { @MainActor in
+                    await captureNormalPosition()
+                    book.settings.mode = mode
+                    readerNavigationID = UUID()
+                    save()
+                }
+            })) {
                 Text("Страницы").tag("page"); Text("Прокрутка").tag("scroll")
             }.pickerStyle(.segmented).padding(.horizontal).padding(.vertical, 6)
             }
@@ -470,10 +579,11 @@ struct ReaderView: View {
                 let width = min(geometry.size.width - book.settings.margin * 2, geometry.size.width * book.settings.width / 100)
                 Group {
                     if let html = book.richHTML {
-                        RichReadingSurface(html: html, book: $book, highlight: highlighted, navigationID: readerNavigationID, immersive: immersive, onRevealControls: { immersive = false })
+                        RichReadingSurface(html: html, book: $book, highlight: highlighted, navigationID: readerNavigationID, immersive: immersive, onRevealControls: { immersive = false }, textWidth: max(80, width), bridge: viewportBridge, suspended: speed)
+                            .frame(width: geometry.size.width)
                             .id("\(readerNavigationID)-\(book.settings.mode)")
                     } else {
-                        ReadingSurface(book: $book, size: CGSize(width: max(80, width), height: max(80, geometry.size.height - 24)), highlight: highlighted, immersive: immersive, onRevealControls: { immersive = false })
+                        ReadingSurface(book: $book, size: CGSize(width: max(80, width), height: max(80, geometry.size.height - 24)), highlight: highlighted, immersive: immersive, onRevealControls: { immersive = false }, canvasWidth: geometry.size.width)
                             .id("\(readerNavigationID)-\(book.settings.mode)")
                     }
                 }
@@ -482,7 +592,13 @@ struct ReaderView: View {
             }
             if !immersive {
             HStack {
-                Button { speed = true } label: { Image(systemName: "play.circle.fill") }.accessibilityLabel("Скорочтение")
+                Button {
+                    Task { @MainActor in
+                        await captureNormalPosition()
+                        book.position = book.normalPosition
+                        speed = true
+                    }
+                } label: { Image(systemName: "play.circle.fill") }.accessibilityLabel("Скорочтение")
                 Spacer()
                 Button { immersive = true } label: { Image(systemName: "arrow.up.left.and.arrow.down.right") }.accessibilityLabel("Полноэкранное чтение")
                 Spacer()
@@ -538,7 +654,6 @@ struct ReaderView: View {
         .onAppear { book.lastOpened = Date(); save() }
         .onDisappear { save() }
         .onChange(of: scene) { _, value in if value != .active { save() } }
-        .onChange(of: speed) { _, value in if value { book.position = book.normalPosition } }
         .onChange(of: book.isFinished) { _, value in if value { finishedAlert = true } }
         .alert("Книга дочитана", isPresented: $finishedAlert) {
             Button("Начать сначала") { book.normalPosition = 0; book.position = 0; book.isFinished = false; save() }
@@ -582,6 +697,9 @@ struct ReaderView: View {
     }
     func jump(_ offset: Int) { book.normalPosition = offset; book.position = offset; readerNavigationID = UUID(); panel = nil; save() }
     func save() { library.update(book) }
+    func captureNormalPosition() async {
+        if book.richHTML != nil, let offset = await viewportBridge.capture?() { book.normalPosition = offset }
+    }
     func addBookmark() {
         let source = book.text as NSString
         let start = min(book.normalPosition, source.length)
@@ -651,6 +769,7 @@ struct ReadingSurface: View {
     let highlight: NSRange?
     let immersive: Bool
     let onRevealControls: () -> Void
+    var canvasWidth: CGFloat? = nil
     @State private var scrollTurn = 0
     @State private var ranges: [NSRange] = []
     @State private var selection = 0
@@ -676,13 +795,14 @@ struct ReadingSurface: View {
                 }
             }
         }
+        .frame(width: size.width, height: size.height)
+        .frame(width: canvasWidth ?? size.width, height: size.height)
         .contentShape(Rectangle())
         .simultaneousGesture(SpatialTapGesture().onEnded { tap in
-            guard immersive else { return }
-            let direction = ReadingTapZones.direction(x: tap.location.x, width: size.width)
-            if direction == 0 { onRevealControls() }
+            let direction = ReadingTapZones.direction(x: tap.location.x, width: canvasWidth ?? size.width)
+            if direction == 0 { if immersive { onRevealControls() } }
             else if book.settings.mode == "page" { selection = min(max(0, selection + direction), max(0, ranges.count - 1)) }
-            else { scrollTurn += direction }
+            else if immersive { scrollTurn += direction }
         })
         .task(id: layoutKey) {
             ranges = PageLayoutEngine.ranges(attributed, size: CGSize(width: size.width, height: max(1, size.height - 22)))

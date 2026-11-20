@@ -94,6 +94,31 @@ final class NavigationChecks: NSObject, WKNavigationDelegate {
             state.book.settings.mode = "page"
             state.navigationID = UUID()
             try await visible("Страницы после Прокрутки", paged: true)
+            guard let movingWeb = webView(in: host.view) else { throw NSError(domain: "No active WebView", code: 1) }
+            movingWeb.scrollView.setContentOffset(CGPoint(x: movingWeb.bounds.width * 3, y: 0), animated: false)
+            guard let captured = await state.bridge.capture?(), captured > 0, captured != offset else {
+                throw NSError(domain: "Видимая позиция после реального смещения страницы", code: 1)
+            }
+            state.book.normalPosition = captured
+            state.book.settings.mode = "scroll"
+            state.navigationID = UUID()
+            try await visible("Прокрутка после фактического перелистывания", paged: false, target: captured)
+            guard let scrollingWeb = webView(in: host.view), scrollingWeb.scrollView.isScrollEnabled,
+                  scrollingWeb.scrollView.panGestureRecognizer.isEnabled,
+                  scrollingWeb.scrollView.contentSize.height > scrollingWeb.bounds.height * 2 else {
+                throw NSError(domain: "Вертикальная область прокрутки", code: 1)
+            }
+            scrollingWeb.scrollView.setContentOffset(CGPoint(x: 0, y: scrollingWeb.bounds.height * 2), animated: false)
+            guard let scrolled = await state.bridge.capture?(), scrolled > 0, scrolled != captured else {
+                throw NSError(domain: "Позиция после вертикального смещения", code: 1)
+            }
+            state.book.normalPosition = scrolled
+            state.book.settings.mode = "page"
+            state.navigationID = UUID()
+            try await visible("Страницы после фактической прокрутки", paged: true, target: scrolled)
+            state.book.normalPosition = offset
+            state.navigationID = UUID()
+            try await visible("Возврат к исходному якорю", paged: true)
             state.immersive = true
             state.navigationID = UUID()
             try await visible("Полноэкранные Страницы", paged: true)
@@ -129,6 +154,10 @@ final class NavigationChecks: NSObject, WKNavigationDelegate {
                     "Реальная WKWebView: следующая страница",
                     "Реальная WKWebView: предыдущая страница",
                     "Реальная WKWebView: граница начала книги"]
+                + ["Считывание позиции после нативного перелистывания",
+                   "Прокрутка после фактического перелистывания",
+                   "Страницы после фактической прокрутки",
+                   "Вертикальная область прокрутки и считывание позиции"]
         } catch {
             await withCheckedContinuation { continuation in host.dismiss(animated: false) { continuation.resume() } }
             throw error
@@ -141,13 +170,14 @@ final class HandoffState: ObservableObject {
     @Published var book: Book
     @Published var navigationID = UUID()
     @Published var immersive = false
+    let bridge = ReaderViewportBridge()
     init(_ book: Book) { self.book = book }
 }
 struct HandoffHarness: View {
     @ObservedObject var state: HandoffState
     var body: some View {
         RichReadingSurface(html: state.book.richHTML!, book: $state.book, highlight: nil,
-                           navigationID: state.navigationID, immersive: state.immersive, onRevealControls: {})
+                           navigationID: state.navigationID, immersive: state.immersive, onRevealControls: {}, bridge: state.bridge)
             .id("\(state.navigationID)-\(state.book.settings.mode)")
     }
 }

@@ -131,17 +131,19 @@ final class LibraryStore: ObservableObject {
         customStorage = directory
         load()
         #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains("--demo"), books.isEmpty {
+        if (ProcessInfo.processInfo.arguments.contains("--demo") || ProcessInfo.processInfo.arguments.contains("--interaction-demo")), books.isEmpty {
             let paragraphs = (1...300).map { "<p>Абзац \($0). Когда читаешь книгу, слова складываются в историю. Кириллица и Latin, ёж и эмодзи 😀. Следующая строка помогает проверить сохранение позиции.</p>" }.joined()
             let xml = "<FictionBook><description><title-info><book-title>Проверка читалки</book-title></title-info></description><body><section><title><p>Первая глава</p></title>" + paragraphs + "</section><section><title><p>Вторая глава</p></title><p>Последняя страница книги.</p></section></body></FictionBook>"
-            if let book = try? BookParser.parse(data: Data(xml.utf8), fileName: "demo.fb2") { books = [book] }
+            if let book = try? BookParser.parse(data: Data(xml.utf8), fileName: "demo.fb2") {
+                _ = try? persistImport(data: Data(xml.utf8), parsed: book)
+            }
         }
         #endif
     }
 
     var storageURL: URL {
         customStorage ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent(ProcessInfo.processInfo.arguments.contains("--demo") ? "FaReApp-QA" : "FaReApp", isDirectory: true)
+            .appendingPathComponent(ProcessInfo.processInfo.arguments.contains("--interaction-demo") ? "FaReApp-Interaction-QA" : ProcessInfo.processInfo.arguments.contains("--demo") ? "FaReApp-QA" : "FaReApp", isDirectory: true)
     }
 
     @discardableResult
