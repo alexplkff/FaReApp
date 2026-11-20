@@ -1,0 +1,91 @@
+{
+  "device": "iPhone 17 Pro",
+  "systemVersion": "26.7.1",
+  "fixtureBytes": 1953703,
+  "before": {
+    "status": "failed",
+    "targetOffset": 342580,
+    "modelOffset": 342580,
+    "nativeOffset": [
+      0,
+      0
+    ],
+    "contentSize": [
+      402,
+      706618
+    ],
+    "columnWidth": "auto"
+  },
+  "controlledComparison": {
+    "before": {
+      "bodyHeight": "778px",
+      "columnCount": "1",
+      "scrollHeight": 706618,
+      "scrollWidth": 402,
+      "supportsDvh": true
+    },
+    "bodyHeight": "778px",
+    "columnCount": "1",
+    "columnFill": "auto",
+    "containerProbe": {
+      "bodyWithColumnWidth": {
+        "height": 778,
+        "width": 373458
+      },
+      "innerContainer": {
+        "height": 778,
+        "width": 373458
+      },
+      "innerHeight": "778px"
+    },
+    "height": 778,
+    "inlineHeight": "778px",
+    "scrollHeight": 706618,
+    "scrollWidth": 402,
+    "width": 402
+  },
+  "after": {
+    "cases": [
+      "Реальная WKWebView: Страницы после закрытия скорочтения",
+      "Реальная WKWebView: Прокрутка после Страниц",
+      "Реальная WKWebView: Страницы после Прокрутки",
+      "Реальная WKWebView: полноэкранные Страницы",
+      "Реальная WKWebView: Страницы после изменения шрифта",
+      "Реальная WKWebView: возврат на первую страницу",
+      "Реальная WKWebView: зоны перелистывания",
+      "Реальная WKWebView: следующая страница",
+      "Реальная WKWebView: предыдущая страница",
+      "Реальная WKWebView: граница начала книги",
+      "Считывание позиции после нативного перелистывания",
+      "Прокрутка после фактического перелистывания",
+      "Страницы после фактической прокрутки",
+      "Вертикальная область прокрутки и считывание позиции",
+      "Поздний ответ удалённого WebView не сбрасывает позицию",
+      "Возврат из скорочтения сохраняет экземпляр WebView",
+      "Последний символ доступен в Страницах",
+      "Последний символ доступен в Прокрутке",
+      "Страницы формируют горизонтальные колонки фиксированной высоты"
+    ],
+    "offset": 342580,
+    "status": "passed",
+    "systemVersion": "26.7.1",
+    "viewport": {
+      "before": {
+        "bodyHeight": "778px",
+        "columnCount": "1",
+        "scrollHeight": 778,
+        "scrollWidth": 373458,
+        "supportsDvh": true
+      },
+      "bodyHeight": "778px",
+      "columnCount": "1",
+      "columnFill": "auto",
+      "columnWidth": "402px",
+      "height": 778,
+      "inlineHeight": "778px",
+      "scrollHeight": 778,
+      "scrollWidth": 373458,
+      "width": 402
+    }
+  }
+}

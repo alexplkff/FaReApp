@@ -10,6 +10,20 @@ enum ReaderNavigation {
     let programmatic=false;
     let readerNavigationID='';
     let readerImmersive=false;
+    function readerSetViewport(width,height,paged){
+      const body=document.body,root=document.documentElement;
+      if(!window.readerViewportBefore)window.readerViewportBefore={
+        bodyHeight:getComputedStyle(body).height,columnCount:getComputedStyle(body).columnCount,
+        scrollWidth:root.scrollWidth,scrollHeight:root.scrollHeight,
+        supportsDvh:CSS.supports('height','100dvh')};
+      // iPhone WebKit can keep a column-count:1 body in vertical flow when its
+      // column-width is auto. Supply both column dimensions from the native view.
+      body.style.width=Math.max(1,Math.round(width))+'px';
+      body.style.columnWidth=paged?Math.max(1,Math.round(width))+'px':'auto';
+      body.style.height=paged?Math.max(1,Math.floor(height))+'px':'auto';
+      root.style.height=paged?Math.max(1,Math.floor(height))+'px':'auto';
+      root.style.setProperty('--reader-image-height',Math.max(1,height*0.75)+'px');
+    }
     function readerTapDirection(x,width){return x<width*0.3?-1:x>width*0.7?1:0}
     function readerTurn(direction){
       const root=document.scrollingElement;
@@ -66,8 +80,9 @@ enum ReaderNavigation {
       if(range){
         programmatic=true;
         const rect=range.getBoundingClientRect();
-        const targetX=paged?Math.floor((rect.left+scrollX+0.5)/innerWidth)*innerWidth:0;
-        const targetY=paged?0:Math.max(0,rect.top+scrollY-8);
+        const root=document.scrollingElement;
+        const targetX=paged?Math.min(Math.max(0,root.scrollWidth-innerWidth),Math.floor((rect.left+scrollX+0.5)/innerWidth)*innerWidth):0;
+        const targetY=paged?0:Math.min(Math.max(0,root.scrollHeight-innerHeight),Math.max(0,rect.top+scrollY-8));
         scrollTo(targetX,targetY);
         setTimeout(()=>programmatic=false,250);
         return {offset,page:Math.round(targetX/innerWidth),targetX,targetY,found:true};
@@ -177,7 +192,7 @@ struct RichReadingSurface: UIViewRepresentable {
             let dark = book.settings.theme == "dark" || (book.settings.theme == "system" && view.traitCollection.userInterfaceStyle == .dark)
             let color = dark ? "#eee" : "#181818"
             let bg = dark ? "#111" : book.settings.theme == "sepia" ? "#f7edd4" : "#fff"
-            let columns = book.settings.mode == "page" ? "height:100dvh;width:100vw;column-count:1;column-gap:0;column-fill:auto;" : ""
+            let columns = book.settings.mode == "page" ? "height:100dvh;width:100vw;column-width:100vw;column-count:1;column-gap:0;column-fill:auto;" : ""
             let scaledSize = UIFontMetrics(forTextStyle: .body).scaledValue(for: book.normalFontSize)
             let document = """
             <!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
@@ -185,7 +200,7 @@ struct RichReadingSurface: UIViewRepresentable {
             <style>
             *{box-sizing:border-box}html{background:\(bg);color:\(color);overflow-y:\(book.settings.mode == "page" ? "hidden" : "auto")}
             body{margin:0;padding:0;font-family:'\(book.settings.font)',-apple-system,'Apple Color Emoji',serif;font-size:\(scaledSize)px;line-height:\(scaledSize + book.lineSpacing)px;\(columns)}
-            p{margin:0 0 0.6em}img{display:block;max-width:100%;max-height:75dvh;object-fit:contain;break-inside:avoid}h1,h2,h3{line-height:1.2;break-after:avoid}
+            p{margin:0 0 0.6em}img{display:block;max-width:100%;max-height:var(--reader-image-height,75vh);object-fit:contain;break-inside:avoid}h1,h2,h3{line-height:1.2;break-after:avoid}
             a{color:#1677cc}section{margin:0}blockquote{margin:1em}mark{background:#ffdf58;color:#111}
             </style></head><body>\(html)
             <script>
@@ -259,7 +274,7 @@ struct RichReadingSurface: UIViewRepresentable {
         }
         func navigate(_ view: WKWebView) {
             let viewport = view.bounds.size
-            guard ready, view.window != nil, viewport.width > 1, viewport.height > 1,
+            guard ready, !parent.suspended, view.window != nil, viewport.width > 1, viewport.height > 1,
                   lastPosition != parent.book.normalPosition || lastNavigationID != parent.navigationID || lastViewport != viewport else { return }
             let offset = parent.book.normalPosition
             let navigationID = parent.navigationID
@@ -267,28 +282,65 @@ struct RichReadingSurface: UIViewRepresentable {
             guard pendingRequest != request else { return }
             pendingRequest = request
             view.callAsyncJavaScript("""
+                readerSetViewport(width,height,paged);
                 await document.fonts.ready;
                 await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
                 return jump(offset, navigationID);
-                """, arguments: ["offset":offset, "navigationID":navigationID.uuidString], in: nil, in: .page) { [weak self, weak view] result in
+                """, arguments: ["offset":offset, "navigationID":navigationID.uuidString,
+                                  "width":viewport.width, "height":viewport.height,
+                                  "paged":parent.book.settings.mode == "page"], in: nil, in: .page) { [weak self, weak view] result in
                 guard let self, let view, self.pendingRequest == request else { return }
-                self.pendingRequest = nil
                 guard self.parent.navigationID == navigationID, self.parent.book.normalPosition == offset,
-                      view.bounds.size == viewport else { self.navigate(view); return }
-                if case .success(let value) = result {
-                    if let target = value as? [String: Any],
-                       let x = target["targetX"] as? Double, let y = target["targetY"] as? Double {
-                        // WKWebView's native paging scroll view can retain its old page
-                        // when the SwiftUI cover is dismissed. Apply the same target there.
-                        let maxX = max(0, view.scrollView.contentSize.width - viewport.width)
-                        let maxY = max(0, view.scrollView.contentSize.height - viewport.height)
-                        view.scrollView.setContentOffset(CGPoint(x: min(maxX, max(0, x)), y: min(maxY, max(0, y))), animated: false)
-                    }
-                    self.lastPosition = offset
-                    self.lastNavigationID = navigationID
-                    self.lastViewport = viewport
-                    self.synchronizedOffset = view.scrollView.contentOffset
+                      !self.parent.suspended, view.bounds.size == viewport else {
+                    self.pendingRequest = nil; self.navigate(view); return
                 }
+                guard case .success(let value) = result, let target = value as? [String: Any],
+                      let x = target["targetX"] as? Double, let y = target["targetY"] as? Double else {
+                    self.pendingRequest = nil; return
+                }
+                self.commitNavigation(view, request: request, offset: offset, navigationID: navigationID,
+                                      viewport: viewport, target: CGPoint(x: x, y: y))
+            }
+        }
+        func commitNavigation(_ view: WKWebView, request: String, offset: Int, navigationID: UUID,
+                              viewport: CGSize, target: CGPoint, attempt: Int = 0) {
+            guard ready, pendingRequest == request else { return }
+            guard !parent.suspended, parent.navigationID == navigationID,
+                  parent.book.normalPosition == offset, view.bounds.size == viewport else {
+                pendingRequest = nil; navigate(view); return
+            }
+            guard attempt < 80 else { pendingRequest = nil; return }
+            let maxX = max(0, view.scrollView.contentSize.width - viewport.width)
+            let maxY = max(0, view.scrollView.contentSize.height - viewport.height)
+            func retry() {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) { [weak self, weak view] in
+                    guard let self, let view else { return }
+                    self.commitNavigation(view, request: request, offset: offset, navigationID: navigationID,
+                                          viewport: viewport, target: target, attempt: attempt + 1)
+                }
+            }
+            // WebKit updates its DOM and native content size asynchronously. Never
+            // clamp a valid later page to zero and then call that navigation complete.
+            guard target.x <= maxX + 1, target.y <= maxY + 1 else { retry(); return }
+            view.scrollView.setContentOffset(CGPoint(x: min(maxX, target.x), y: min(maxY, target.y)), animated: false)
+            view.callAsyncJavaScript("""
+                await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+                const r=readerTextRange(offset)?.getBoundingClientRect();
+                return !!r&&r.right>0&&r.left<innerWidth&&r.bottom>0&&r.top<innerHeight;
+                """, arguments: ["offset":offset], in: nil, in: .page) { [weak self, weak view] result in
+                guard let self, let view, self.ready, self.pendingRequest == request else { return }
+                guard !self.parent.suspended, self.parent.navigationID == navigationID,
+                      self.parent.book.normalPosition == offset, view.bounds.size == viewport else {
+                    self.pendingRequest = nil; self.navigate(view); return
+                }
+                guard case .success(let value) = result, value as? Bool == true,
+                      abs(view.scrollView.contentOffset.x - target.x) <= 1,
+                      abs(view.scrollView.contentOffset.y - target.y) <= 1 else { retry(); return }
+                self.lastPosition = offset
+                self.lastNavigationID = navigationID
+                self.lastViewport = viewport
+                self.synchronizedOffset = view.scrollView.contentOffset
+                self.pendingRequest = nil
             }
         }
         func applyHighlight(_ view: WKWebView) {
@@ -310,7 +362,7 @@ struct RichReadingSurface: UIViewRepresentable {
             view.evaluateJavaScript(script, completionHandler: nil)
         }
         func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard ready, pendingRequest == nil, !parent.suspended else { return }
+            guard ready, pendingRequest == nil, !parent.suspended, lastNavigationID == parent.navigationID else { return }
             if let command = message.body as? [String: Any], command["action"] as? String == "reveal" {
                 parent.onRevealControls()
                 return
@@ -344,6 +396,7 @@ struct RichReadingSurface: UIViewRepresentable {
             guard ready, !parent.suspended else { return parent.book.normalPosition }
             if pendingRequest != nil || view.scrollView.contentOffset == synchronizedOffset { return parent.book.normalPosition }
             let id = parent.navigationID
+            let document = documentID
             let result: Any? = await withCheckedContinuation { continuation in
                 view.callAsyncJavaScript("""
                     await new Promise(resolve=>requestAnimationFrame(resolve));
@@ -355,7 +408,8 @@ struct RichReadingSurface: UIViewRepresentable {
                     }
                 }
             }
-            guard parent.navigationID == id, !parent.suspended, let offset = result as? Int else { return parent.book.normalPosition }
+            guard ready, documentID == document, parent.navigationID == id, !parent.suspended,
+                  let offset = result as? Int else { return parent.book.normalPosition }
             synchronizedOffset = view.scrollView.contentOffset
             lastPosition = offset
             parent.book.normalPosition = offset
@@ -560,6 +614,7 @@ struct ReaderView: View {
     @State private var readerNavigationID = UUID()
     @State private var immersive = false
     @State private var viewportBridge = ReaderViewportBridge()
+    @State private var readingSuspended = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -579,9 +634,9 @@ struct ReaderView: View {
                 let width = min(geometry.size.width - book.settings.margin * 2, geometry.size.width * book.settings.width / 100)
                 Group {
                     if let html = book.richHTML {
-                        RichReadingSurface(html: html, book: $book, highlight: highlighted, navigationID: readerNavigationID, immersive: immersive, onRevealControls: { immersive = false }, textWidth: max(80, width), bridge: viewportBridge, suspended: speed)
+                        RichReadingSurface(html: html, book: $book, highlight: highlighted, navigationID: readerNavigationID, immersive: immersive, onRevealControls: { immersive = false }, textWidth: max(80, width), bridge: viewportBridge, suspended: readingSuspended)
                             .frame(width: geometry.size.width)
-                            .id("\(readerNavigationID)-\(book.settings.mode)")
+                            .id("\(book.id)-\(book.settings.mode)")
                     } else {
                         ReadingSurface(book: $book, size: CGSize(width: max(80, width), height: max(80, geometry.size.height - 24)), highlight: highlighted, immersive: immersive, onRevealControls: { immersive = false }, canvasWidth: geometry.size.width)
                             .id("\(readerNavigationID)-\(book.settings.mode)")
@@ -596,6 +651,7 @@ struct ReaderView: View {
                     Task { @MainActor in
                         await captureNormalPosition()
                         book.position = book.normalPosition
+                        readingSuspended = true
                         speed = true
                     }
                 } label: { Image(systemName: "play.circle.fill") }.accessibilityLabel("Скорочтение")
@@ -625,6 +681,7 @@ struct ReaderView: View {
         .fullScreenCover(isPresented: $speed, onDismiss: {
             book.normalPosition = book.position
             readerNavigationID = UUID()
+            readingSuspended = false
             save()
         }) {
             SpeedReadingView(book: $book, onSave: save)
